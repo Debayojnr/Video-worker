@@ -4,6 +4,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -12,6 +13,31 @@ const FILES_DIR = path.join(__dirname, 'files');
 if (!fs.existsSync(FILES_DIR)) fs.mkdirSync(FILES_DIR);
 
 const BASE_URL = process.env.PUBLIC_BASE_URL || 'http://localhost:3000';
+
+// R2 (S3-compatible) client
+const R2_BUCKET = process.env.R2_BUCKET || 'realestate-videos';
+const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || '';
+
+const s3 = new S3Client({
+  region: 'auto',
+  endpoint: process.env.R2_ENDPOINT,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
+});
+
+// Upload a local file to R2 and return its public URL
+async function uploadToR2(localPath, key, contentType) {
+  const body = fs.readFileSync(localPath);
+  await s3.send(new PutObjectCommand({
+    Bucket: R2_BUCKET,
+    Key: key,
+    Body: body,
+    ContentType: contentType,
+  }));
+  return `${R2_PUBLIC_URL}/${key}`;
+}
 
 app.use('/files', express.static(FILES_DIR));
 
@@ -109,9 +135,13 @@ app.post('/render-voiceover', async (req, res) => {
         .run();
     });
 
+    // Upload finished video to R2 and return the permanent public URL
+    const r2Key = `final/${jobId}.mp4`;
+    const finalUrl = await uploadToR2(outputPath, r2Key, 'video/mp4');
+
     res.json({
       status: 'complete',
-      final_video_url: `${BASE_URL}/files/${jobId}/final_voiceover.mp4`
+      final_video_url: finalUrl
     });
 
   } catch (err) {
