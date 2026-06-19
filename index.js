@@ -14,29 +14,41 @@ if (!fs.existsSync(FILES_DIR)) fs.mkdirSync(FILES_DIR);
 
 const BASE_URL = process.env.PUBLIC_BASE_URL || 'http://localhost:3000';
 
-// R2 (S3-compatible) client
-const R2_BUCKET = process.env.R2_BUCKET || 'realestate-videos';
-const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || '';
+// Print exactly what the container sees for R2 at startup
+console.log('[R2 ENV CHECK]', JSON.stringify({
+  R2_ACCESS_KEY_ID_length: (process.env.R2_ACCESS_KEY_ID || '').length,
+  R2_SECRET_ACCESS_KEY_length: (process.env.R2_SECRET_ACCESS_KEY || '').length,
+  R2_ENDPOINT: process.env.R2_ENDPOINT || 'MISSING',
+  R2_BUCKET: process.env.R2_BUCKET || 'MISSING',
+  R2_PUBLIC_URL: process.env.R2_PUBLIC_URL || 'MISSING'
+}));
 
-const s3 = new S3Client({
-  region: 'auto',
-  endpoint: process.env.R2_ENDPOINT,
-  credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-  },
-});
+function getS3() {
+  return new S3Client({
+    region: 'auto',
+    endpoint: process.env.R2_ENDPOINT,
+    credentials: {
+      accessKeyId: process.env.R2_ACCESS_KEY_ID,
+      secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+    },
+  });
+}
 
-// Upload a local file to R2 and return its public URL
 async function uploadToR2(localPath, key, contentType) {
+  const accessKeyId = process.env.R2_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+  if (!accessKeyId || !secretAccessKey) {
+    throw new Error(`R2 credentials missing in container: R2_ACCESS_KEY_ID present=${!!accessKeyId}, R2_SECRET_ACCESS_KEY present=${!!secretAccessKey}`);
+  }
+  const s3 = getS3();
   const body = fs.readFileSync(localPath);
   await s3.send(new PutObjectCommand({
-    Bucket: R2_BUCKET,
+    Bucket: process.env.R2_BUCKET || 'realestate-videos',
     Key: key,
     Body: body,
     ContentType: contentType,
   }));
-  return `${R2_PUBLIC_URL}/${key}`;
+  return `${process.env.R2_PUBLIC_URL}/${key}`;
 }
 
 app.use('/files', express.static(FILES_DIR));
@@ -135,7 +147,6 @@ app.post('/render-voiceover', async (req, res) => {
         .run();
     });
 
-    // Upload finished video to R2 and return the permanent public URL
     const r2Key = `final/${jobId}.mp4`;
     const finalUrl = await uploadToR2(outputPath, r2Key, 'video/mp4');
 
