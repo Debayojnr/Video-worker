@@ -67,6 +67,18 @@ async function downloadFile(url, destPath) {
   });
 }
 
+// Probe a media file and return its duration in seconds (float).
+function getDurationSeconds(filePath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err) return reject(err);
+      const dur = metadata && metadata.format && metadata.format.duration;
+      if (!dur || isNaN(dur)) return reject(new Error('Could not read duration from ' + filePath));
+      resolve(parseFloat(dur));
+    });
+  });
+}
+
 app.post('/extract-frames', async (req, res) => {
   const { video_url, frame_interval_seconds = 2, max_width = 768 } = req.body;
   if (!video_url) return res.status(400).json({ error: 'video_url is required' });
@@ -109,7 +121,15 @@ app.post('/extract-frames', async (req, res) => {
 });
 
 app.post('/render-voiceover', async (req, res) => {
-  const { video_url, voiceover_audio_binary, audio_url, duck_original_audio = true, original_audio_volume = 0.15 } = req.body;
+  const {
+    video_url,
+    voiceover_audio_binary,
+    audio_url,
+    music_url,                 // optional: soft background music track
+    music_volume = 0.12,       // background music level (voiceover stays at 1.0)
+    music_fade_seconds = 2     // fade music out over the last N seconds
+  } = req.body;
+
   if (!video_url) return res.status(400).json({ error: 'video_url is required' });
 
   const jobId = uuidv4();
@@ -118,11 +138,14 @@ app.post('/render-voiceover', async (req, res) => {
 
   const videoPath = path.join(jobDir, 'input.mp4');
   const audioPath = path.join(jobDir, 'voiceover.mp3');
+  const musicPath = path.join(jobDir, 'music.mp3');
   const outputPath = path.join(jobDir, 'final_voiceover.mp4');
 
   try {
+    // 1. Get the video
     await downloadFile(video_url, videoPath);
 
+    // 2. Get the voiceover (base64 from Make, or a URL)
     if (voiceover_audio_binary) {
       const audioBuffer = Buffer.from(voiceover_audio_binary, 'base64');
       fs.writeFileSync(audioPath, audioBuffer);
@@ -132,16 +155,64 @@ app.post('/render-voiceover', async (req, res) => {
       return res.status(400).json({ error: 'audio_url or voiceover_audio_binary required' });
     }
 
+    // 3. Optionally get background music
+    let hasMusic = false;
+    if (music_url) {
+      try {
+        await downloadFile(music_url, musicPath);
+        hasMusic = true;
+      } catch (e) {
+        console.error('Music download failed, continuing voiceover-only:', e.message);
+        hasMusic = false;
+      }
+    }
+
+    // 4. Final length is governed by the VIDEO length
+    const videoDuration = await getDurationSeconds(videoPath);
+    const fadeStart = Math.max(0, videoDuration - music_fade_seconds);
+
+    // 5. Build ffmpeg command.
+    //    We NEVER reference the input video's audio ([0:a]), so silent
+    //    videos render fine. Audio is built purely from voiceover (+music).
     await new Promise((resolve, reject) => {
-      ffmpeg(videoPath)
-        .input(audioPath)
-        .complexFilter([
-          duck_original_audio
-            ? `[0:a]volume=${original_audio_volume}[orig];[orig][1:a]amix=inputs=2:duration=shortest[aout]`
-            : `[1:a]acopy[aout]`
-        ])
-        .outputOptions(['-map 0:v', '-map [aout]', '-c:v copy', '-shortest'])
+      const command = ffmpeg(videoPath).input(audioPath); // 0 = video, 1 = voiceover
+
+      if (hasMusic) {
+        // Loop the music so short tracks still cover the whole video.
+        command.input(musicPath).inputOptions(['-stream_loop', '-1']); // input 2 = music
+
+        // [1:a] voiceover at full volume, padded so it never ends the mix early
+        // [2:a] music looped, lowered, faded out near the end
+        // amix duration=first -> mix length follows the voiceover-pad (which we
+        //   pad to the video length via apad + the output -t cap)
+        const filter =
+          `[1:a]apad,volume=1.0[vo];` +
+          `[2:a]volume=${music_volume},afade=t=out:st=${fadeStart.toFixed(2)}:d=${music_fade_seconds}[bg];` +
+          `[vo][bg]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
+
+        command.complexFilter([filter])
+          .outputOptions([
+            '-map', '0:v',
+            '-map', '[aout]',
+            '-c:v', 'copy',
+            '-t', videoDuration.toFixed(2),  // hard cap to video length
+            '-shortest'
+          ]);
+      } else {
+        // Voiceover only: attach it as the sole audio track.
+        command.complexFilter([`[1:a]apad,volume=1.0[aout]`])
+          .outputOptions([
+            '-map', '0:v',
+            '-map', '[aout]',
+            '-c:v', 'copy',
+            '-t', videoDuration.toFixed(2),
+            '-shortest'
+          ]);
+      }
+
+      command
         .output(outputPath)
+        .on('start', cmd => console.log('[ffmpeg]', cmd))
         .on('end', resolve)
         .on('error', reject)
         .run();
