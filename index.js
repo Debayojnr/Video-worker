@@ -79,6 +79,37 @@ function getDurationSeconds(filePath) {
   });
 }
 
+// Probe a video's duration WITHOUT downloading the whole file to disk first.
+// Returns duration in seconds plus a suggested target word count for the
+// voiceover script, so narration length can match the video length.
+// Speaking pace assumed ~140 words/minute (natural ad-read pace).
+app.post('/probe-duration', async (req, res) => {
+  const { video_url, words_per_minute = 140 } = req.body;
+  if (!video_url) return res.status(400).json({ error: 'video_url is required' });
+
+  const jobId = uuidv4();
+  const jobDir = path.join(FILES_DIR, jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+  const videoPath = path.join(jobDir, 'probe.mp4');
+
+  try {
+    await downloadFile(video_url, videoPath);
+    const durationSeconds = await getDurationSeconds(videoPath);
+    const targetWords = Math.max(40, Math.round((durationSeconds / 60) * words_per_minute));
+
+    // Clean up the probe file; we only needed the duration.
+    try { fs.unlinkSync(videoPath); } catch (e) {}
+
+    res.json({
+      duration_seconds: Math.round(durationSeconds),
+      target_words: targetWords
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/extract-frames', async (req, res) => {
   const { video_url, frame_interval_seconds = 2, max_width = 768 } = req.body;
   if (!video_url) return res.status(400).json({ error: 'video_url is required' });
